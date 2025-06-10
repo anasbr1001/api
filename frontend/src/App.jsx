@@ -13,7 +13,7 @@ export default function App() {
     setLoading(true);
     try {
       const data = await productApi.getAll();
-      setProducts(data.products);
+      setProducts(data.products || data);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -28,7 +28,7 @@ export default function App() {
   const handleCreate = async (product) => {
     try {
       const newProduct = await productApi.create(product);
-      setProducts([...products, newProduct]);
+      setProducts([...products, newProduct.product || newProduct]);
     } catch (err) {
       setError(err.message);
     }

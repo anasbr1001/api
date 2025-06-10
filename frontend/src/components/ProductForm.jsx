@@ -3,13 +3,16 @@ import { useState } from 'react';
 export default function ProductForm({ onCreate }) {
   const [product, setProduct] = useState({
     title: '',
-    price: 0
+    price: ''
   });
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    onCreate(product);
-    setProduct({ title: '', price: 0 });
+    const productData = { ...product };
+    if (productData.price === '') delete productData.price;
+    else productData.price = parseFloat(productData.price);
+    onCreate(productData);
+    setProduct({ title: '', price: '' });
   };
 
   return (
@@ -24,11 +27,10 @@ export default function ProductForm({ onCreate }) {
       <input
         type="number"
         value={product.price}
-        onChange={(e) => setProduct({...product, price: parseFloat(e.target.value) || 0})}
-        placeholder="Price"
+        onChange={(e) => setProduct({...product, price: e.target.value})}
+        placeholder="Price (optionnel)"
         step="0.01"
         min="0"
-        required
       />
       <button type="submit">Add Product</button>
     </form>

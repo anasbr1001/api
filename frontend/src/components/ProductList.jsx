@@ -4,7 +4,8 @@ export default function ProductList({ products, onDelete }) {
         {products.map(product => (
           <li key={product.id} className="product-item">
             <span>
-              {product.title} - ${product.price.toFixed(2)}
+              {product.title} - $
+              {typeof product.price === 'number' ? product.price.toFixed(2) : 'N/A'}
             </span>
             <button 
               onClick={() => onDelete(product.id)}

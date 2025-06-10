@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -8,102 +8,246 @@ from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
 import re
+import jwt
+from functools import wraps
+import bcrypt
+from price_predictor import price_predictor
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
 
-# Database configuration with explicit defaults
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'dbname': os.getenv('DB_NAME', 'data'),
-    'user': os.getenv('DB_USER', 'postgres'),
-    'password': os.getenv('DB_PASSWORD', 'Anasanas.1'),
-    'port': os.getenv('DB_PORT', '5432')
-}
+# Simple CORS configuration
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": ["http://localhost:3000"],
+             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+             "allow_headers": ["Content-Type", "Authorization"],
+             "supports_credentials": True,
+             "expose_headers": ["Content-Type", "Authorization"]
+         }
+     })
+
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key')
 
 def get_db_connection():
-    """Establish connection to PostgreSQL database with detailed error handling"""
     try:
         conn = psycopg2.connect(
-            host=DB_CONFIG['host'],
-            dbname=DB_CONFIG['dbname'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password'],
-            port=DB_CONFIG['port']
+            host=os.getenv('DB_HOST', 'localhost'),
+            database=os.getenv('DB_NAME', 'data'),
+            user=os.getenv('DB_USER', 'postgres'),
+            password=os.getenv('DB_PASSWORD', 'Anasanas.1'),
+            port=os.getenv('DB_PORT', '5432')
         )
-        print(f"✅ Successfully connected to database: {DB_CONFIG['dbname']}")
         return conn
-    except psycopg2.OperationalError as e:
-        print(f"❌ Database connection failed: {e}")
-        print("\nAttempted connection with these parameters:")
-        print(f"  Host: {DB_CONFIG['host']}")
-        print(f"  Database: {DB_CONFIG['dbname']}")
-        print(f"  User: {DB_CONFIG['user']}")
-        print(f"  Port: {DB_CONFIG['port']}")
-        print("  (Password hidden for security)\n")
-        return None
     except Exception as e:
-        print(f"⚠️ Unexpected database error: {str(e)}")
+        print("Database connection error:", str(e))
         return None
 
-def extract_product_info(url):
-    """Extract product info from URL with enhanced error handling"""
+def initialize_database():
+    """Initialize the database with required tables"""
+    conn = None
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise exception for HTTP errors
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Enhanced name extraction
-        name = None
-        for tag in ['h1', 'title']:
-            if not name and soup.find(tag):
-                name = soup.find(tag).get_text(strip=True)
-                if name: break
-        
-        # Enhanced price extraction
-        price = None
-        price_patterns = [r'[\d,.]+', r'\$\d+\.\d{2}', r'\d+\.\d{2}\s*€']
-        price_elements = soup.find_all(class_=re.compile(r'price|prix|cost|value', re.I))
-        
-        for elem in price_elements:
-            price_text = elem.get_text(strip=True)
-            for pattern in price_patterns:
-                match = re.search(pattern, price_text)
-                if match:
-                    try:
-                        price = float(match.group().replace(',', ''))
-                        break
-                    except ValueError:
-                        continue
-            if price: break
-        
-        # Enhanced description extraction
-        description = None
-        desc_elements = soup.find_all(class_=re.compile(r'description|product-desc|detail|info', re.I))
-        
-        for elem in desc_elements[:3]:  # Check first 3 potential elements
-            if elem.get_text(strip=True):
-                description = elem.get_text(strip=True)[:500]
-                break
-        
-        return {
-            'title': name,
-            'price': price,
-            'description': description
-        }
-    except requests.RequestException as e:
-        print(f"🌐 Network error extracting product info: {e}")
-        return None
+        conn = get_db_connection()
+        if conn:
+            with conn.cursor() as cur:
+                # Create users table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        username VARCHAR(50) UNIQUE NOT NULL,
+                        email VARCHAR(255) UNIQUE NOT NULL,
+                        password VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.commit()
+                print("Database initialized successfully")
     except Exception as e:
-        print(f"⚠️ Error extracting product info: {e}")
-        return None
+        print("Database initialization error:", str(e))
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+# Initialize database when the app starts
+initialize_database()
+
+@app.route('/auth/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        username = data.get('username', '').strip()
+        email = data.get('email', '').strip()
+        password = data.get('password', '')
+        confirm_password = data.get('confirmPassword', '')
+
+        # Validate username
+        if not username:
+            return jsonify({"error": "Username is required"}), 400
+        if len(username) < 2:
+            return jsonify({"error": "Username must be at least 2 characters long"}), 400
+
+        # Validate email
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
+        if not '@' in email:
+            return jsonify({"error": "Invalid email format"}), 400
+
+        # Validate password
+        if not password:
+            return jsonify({"error": "Password is required"}), 400
+        if len(password) < 8:
+            return jsonify({"error": "Password must be at least 8 characters long"}), 400
+        if not any(c.isupper() for c in password):
+            return jsonify({"error": "Password must contain at least one uppercase letter"}), 400
+        if not any(c.islower() for c in password):
+            return jsonify({"error": "Password must contain at least one lowercase letter"}), 400
+        if not any(c.isdigit() for c in password):
+            return jsonify({"error": "Password must contain at least one number"}), 400
+
+        # Validate password confirmation
+        if not confirm_password:
+            return jsonify({"error": "Please confirm your password"}), 400
+        if password != confirm_password:
+            return jsonify({"error": "Passwords do not match"}), 400
+
+        # Check if username or email already exists
+        conn = get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email))
+                    existing_user = cur.fetchone()
+                    if existing_user:
+                        return jsonify({"error": "Username or email already exists"}), 400
+
+                    # Hash password
+                    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+                    
+                    # Insert new user
+                    cur.execute(
+                        "INSERT INTO users (username, email, password) VALUES (%s, %s, %s) RETURNING id, username, email",
+                        (username, email, hashed_password.decode('utf-8'))
+                    )
+                    new_user = cur.fetchone()
+                    conn.commit()
+                    
+                    # Generate token
+                    token = jwt.encode(
+                        {'user_id': new_user['id'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=1)},
+                        app.config['SECRET_KEY']
+                    )
+                    
+                    return jsonify({
+                        "message": "Registration successful",
+                        "token": token,
+                        "user": {
+                            "id": new_user['id'],
+                            "username": new_user['username'],
+                            "email": new_user['email']
+                        }
+                    }), 201
+            except Exception as e:
+                print("Database error:", str(e))
+                conn.rollback()
+                return jsonify({"error": "Database error occurred"}), 500
+            finally:
+                conn.close()
+        else:
+            return jsonify({"error": "Database connection failed"}), 500
+    except Exception as e:
+        print("Registration error:", str(e))
+        return jsonify({"error": str(e)}), 500
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', 'http://localhost:3000')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Special handler for OPTIONS requests
+@app.route('/auth/login', methods=['OPTIONS'])
+def login_options():
+    response = jsonify({"message": "Preflight accepted"})
+    response.headers.add("Access-Control-Allow-Origin", "http://localhost:3000")
+    response.headers.add("Access-Control-Allow-Headers", "*")
+    response.headers.add("Access-Control-Allow-Methods", "*")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response
+
+@app.route('/auth/login', methods=['POST'])
+def login():
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
+
+        if not username or not password:
+            return jsonify({"error": "Username and password are required"}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # First check if user exists
+                cur.execute("""
+                    SELECT id, username, email, password 
+                    FROM users 
+                    WHERE username = %s
+                """, (username,))
+                
+                user = cur.fetchone()
+                
+                if not user:
+                    return jsonify({"error": "Invalid username or password"}), 401
+                
+                # Verify password
+                if not bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+                    return jsonify({"error": "Invalid username or password"}), 401
+                
+                # Generate token
+                token = jwt.encode(
+                    {
+                        'user_id': user['id'],
+                        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=1)
+                    },
+                    app.config['SECRET_KEY'],
+                    algorithm='HS256'
+                )
+                
+                return jsonify({
+                    "message": "Login successful",
+                    "token": token,
+                    "user": {
+                        "id": user['id'],
+                        "username": user['username'],
+                        "email": user['email']
+                    }
+                }), 200
+        except Exception as e:
+            print("Database error during login:", str(e))
+            conn.rollback()
+            return jsonify({"error": "Database error occurred"}), 500
+        finally:
+            conn.close()
+    except Exception as e:
+        print("Login error:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 # 1. ROOT ENDPOINT
 @app.route('/')
@@ -150,7 +294,7 @@ def health_check():
                     db_version = cur.fetchone()[0]
                     diagnostics["database_version"] = db_version
                     
-                    cur.execute("SELECT COUNT(*) FROM scraped_data")
+                    cur.execute("SELECT COUNT(*) FROM products")
                     product_count = cur.fetchone()[0]
                     diagnostics["product_count"] = product_count
             except Exception as e:
@@ -169,11 +313,10 @@ def health_check():
 # 3. GET ALL PRODUCTS (PAGINATED)
 @app.route('/products', methods=['GET'])
 def get_products():
-    """Get all products with pagination and enhanced error handling"""
+    """Get all products with pagination"""
     try:
         page = request.args.get('page', default=1, type=int)
         per_page = request.args.get('per_page', default=10, type=int)
-        search = request.args.get('search', default=None, type=str)
         
         if page < 1 or per_page < 1:
             return jsonify({"error": "Page and per_page must be positive integers"}), 400
@@ -184,29 +327,21 @@ def get_products():
         
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Base query
-                query = "SELECT id, title, description FROM scraped_data"
-                count_query = "SELECT COUNT(*) FROM scraped_data"
-                params = []
-                
-                # Add search filter if provided
-                if search:
-                    search_term = f"%{search}%"
-                    query += " WHERE title ILIKE %s OR description ILIKE %s"
-                    count_query += " WHERE title ILIKE %s OR description ILIKE %s"
-                    params.extend([search_term, search_term])
-                
                 # Get total count
-                cur.execute(count_query, params)
+                cur.execute("""
+                    SELECT COUNT(*) 
+                    FROM scraped_data 
+                """)
                 total = cur.fetchone()['count']
                 
-                # Add pagination
+                # Get paginated products
                 offset = (page - 1) * per_page
-                query += " LIMIT %s OFFSET %s"
-                params.extend([per_page, offset])
-                
-                # Execute final query
-                cur.execute(query, params)
+                cur.execute("""
+                    SELECT id, title, description, price 
+                    FROM scraped_data 
+                    ORDER BY id DESC 
+                    LIMIT %s OFFSET %s
+                """, (per_page, offset))
                 products = cur.fetchall()
                 
                 return jsonify({
@@ -235,7 +370,7 @@ def get_product(product_id):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, title, description 
+                SELECT id, title, description, price 
                 FROM scraped_data 
                 WHERE id = %s
             """, (product_id,))
@@ -252,56 +387,83 @@ def get_product(product_id):
 # 5. CREATE PRODUCT
 @app.route('/products', methods=['POST'])
 def create_product():
-    """Create new product with optional auto-scraping"""
-    data = request.get_json()
-    
-    if not data or 'url' not in data:
-        return jsonify({"error": "Product URL is required"}), 400
-    
-    # Auto-extract product info if only URL provided
-    if 'url' in data and len(data) == 1:
-        extracted_data = extract_product_info(data['url'])
-        if extracted_data:
-            data.update(extracted_data)
-        else:
-            print("Warning: Could not auto-extract product data")
-    
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({"error": "Database connection failed"}), 500
-    
+    """Create new product with price prediction"""
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Check if product already exists
-            cur.execute("SELECT id FROM scraped_data WHERE title = %s", (data.get('title'),))
-            if cur.fetchone():
-                return jsonify({"error": "Product with this title already exists"}), 409
-            
-            # Insert new product
-            cur.execute("""
-                INSERT INTO scraped_data (title, description)
-                VALUES (%s, %s, %s)
-                RETURNING id, title, description 
-            """, (
-                data.get('title'),
-                data.get('description'),
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        title = data.get('title', '').strip()
+        description = data.get('description', '').strip()
+        category = data.get('category', 'electronics').strip()
+        input_price = data.get('price')  # Get the input price
+        
+        if not title:
+            return jsonify({"error": "Title is required"}), 400
+
+        # Get predicted price using input price
+        predicted_price = price_predictor.predict_price(
+            title=title,
+            description=description,
+            category=category,
+            input_price=input_price
+        )
+        
+        if predicted_price is None:
+            # If prediction fails, use input price or default
+            predicted_price = input_price if input_price is not None else 1000.0
+            print("Using input price or default due to prediction failure")
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database connection failed"}), 500
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # First check if product already exists
+                cur.execute("""
+                    SELECT id FROM scraped_data 
+                    WHERE title = %s
+                """, (title,))
                 
-            ))
-            
-            new_product = cur.fetchone()
-            conn.commit()
-            
-            return jsonify({
-                "message": "Product created successfully",
-                "product": new_product,
-                "auto_filled": 'title' not in data or 'description' not in data
-            }), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if conn:
+                if cur.fetchone():
+                    return jsonify({"error": "Product with this title already exists"}), 400
+
+                # Insert new product
+                cur.execute("""
+                    INSERT INTO scraped_data (title, description, price, category)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, title, description, price, category
+                """, (
+                    title,
+                    description,
+                    predicted_price,
+                    category
+                ))
+                
+                new_product = cur.fetchone()
+                conn.commit()
+                
+                return jsonify({
+                    "message": "Product created successfully",
+                    "product": {
+                        "id": new_product['id'],
+                        "title": new_product['title'],
+                        "description": new_product['description'],
+                        "price": new_product['price'],
+                        "category": new_product['category']
+                    }
+                }), 201
+        except Exception as e:
+            print("Database error:", str(e))
+            conn.rollback()
+            return jsonify({"error": "Database error occurred"}), 500
+        finally:
             conn.close()
+    except Exception as e:
+        print("Error creating product:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 # 6. UPDATE PRODUCT
 @app.route('/products/<int:product_id>', methods=['PUT'])
@@ -312,6 +474,9 @@ def update_product(product_id):
     if not data:
         return jsonify({"error": "No data provided"}), 400
     
+    if 'price' in data and not isinstance(data['price'], (int, float)):
+        return jsonify({"error": "Price must be a number"}), 400
+    
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Database connection failed"}), 500
@@ -319,14 +484,17 @@ def update_product(product_id):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # First check if product exists
-            cur.execute("SELECT id FROM scraped_data WHERE id = %s", (product_id,))
+            cur.execute("""
+                SELECT id FROM scraped_data 
+                WHERE id = %s
+            """, (product_id,))
             if not cur.fetchone():
                 return jsonify({"error": "Product not found"}), 404
             
             # Build dynamic update query
             updates = []
             params = []
-            for field in ['title', 'description']:
+            for field in ['title', 'description', 'price']:
                 if field in data:
                     updates.append(f"{field} = %s")
                     params.append(data[field])
@@ -334,13 +502,13 @@ def update_product(product_id):
             if not updates:
                 return jsonify({"error": "No fields to update"}), 400
                 
-            params.append(product_id)
+            params.extend([product_id])
             
             query = f"""
                 UPDATE scraped_data
                 SET {', '.join(updates)}
                 WHERE id = %s
-                RETURNING id, title, description
+                RETURNING id, title, description, price
             """
             
             cur.execute(query, params)
@@ -369,7 +537,10 @@ def delete_product(product_id):
     try:
         with conn.cursor() as cur:
             # Check if product exists
-            cur.execute("SELECT id FROM scraped_data WHERE id = %s", (product_id,))
+            cur.execute("""
+                SELECT id FROM scraped_data 
+                WHERE id = %s
+            """, (product_id,))
             if not cur.fetchone():
                 return jsonify({"error": "Product not found"}), 404
             
@@ -420,58 +591,12 @@ def search_products():
         if conn:
             conn.close()
 
-def initialize_database():
-    """Initialize the database with detailed setup"""
-    print("\n🔧 Initializing database...")
-    conn = None
-    try:
-        conn = get_db_connection()
-        if conn:
-            with conn.cursor() as cur:
-                # Check if table exists
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'scraped_data'
-                    )
-                """)
-                table_exists = cur.fetchone()[0]
-                
-                if not table_exists:
-                    print("🛠 Creating scraped_data table...")
-                    cur.execute("""
-                        CREATE TABLE scraped_data (
-                            id SERIAL PRIMARY KEY,
-                            title VARCHAR(255),
-                            description TEXT,
-                            
-                        )
-                    """)
-                    conn.commit()
-                    print("✅ scraped_data table created")
-                else:
-                    print("ℹ️ scraped_data table already exists")
-        else:
-            print("❌ Failed to initialize database - no connection")
-    except Exception as e:
-        print(f"⚠️ Error initializing database: {str(e)}")
-        if conn:
-            conn.rollback()
-    finally:
-        if conn:
-            conn.close()
-
 if __name__ == '__main__':
-    print("\n🚀 Starting Product API Service")
-    print("-----------------------------")
+    print("Starting Flask server...")
     print("Configuration:")
-    print(f"  Host: {DB_CONFIG['host']}")
-    print(f"  Database: {DB_CONFIG['dbname']}")
-    print(f"  User: {DB_CONFIG['user']}")
-    print(f"  Port: {DB_CONFIG['port']}")
+    print(f"  Host: {os.getenv('DB_HOST', 'localhost')}")
+    print(f"  Database: {os.getenv('DB_NAME', 'data')}")
+    print(f"  User: {os.getenv('DB_USER', 'postgres')}")
+    print(f"  Port: {os.getenv('DB_PORT', '5432')}")
     print("  (Password hidden for security)")
-    
-    initialize_database()
-    
-    print("\n🌍 Starting Flask server...")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True)
